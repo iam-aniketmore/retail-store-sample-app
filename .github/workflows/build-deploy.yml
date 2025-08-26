@@ -24,6 +24,7 @@ jobs:
     outputs:
       services: ${{ steps.set-services.outputs.services }}
       ui: ${{ steps.changes.outputs.ui }}
+      
       catalog: ${{ steps.changes.outputs.catalog }}
       cart: ${{ steps.changes.outputs.cart }}
       orders: ${{ steps.changes.outputs.orders }}
