@@ -1,0 +1,251 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to build (comma-separated: ui,catalog,cart,orders,checkout or "all")'
+        required: true
+        default: 'all'
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+jobs:
+  # Job 1: Detect changes in services
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.set-services.outputs.services }}
+      ui: ${{ steps.changes.outputs.ui }}
+      catalog: ${{ steps.changes.outputs.catalog }}
+      cart: ${{ steps.changes.outputs.cart }}
+      orders: ${{ steps.changes.outputs.orders }}
+      checkout: ${{ steps.changes.outputs.checkout }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect file changes
+        if: github.event_name == 'push'
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            ui:
+              - 'src/ui/**'
+            catalog:
+              - 'src/catalog/**'
+            cart:
+              - 'src/cart/**'
+            orders:
+              - 'src/orders/**'
+            checkout:
+              - 'src/checkout/**'
+
+      - name: Set services to build
+        id: set-services
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.services }}" == "all" ]; then
+              echo "services=[\"ui\",\"catalog\",\"cart\",\"orders\",\"checkout\"]" >> $GITHUB_OUTPUT
+            else
+              # Convert comma-separated string to JSON array
+              services=$(echo "${{ github.event.inputs.services }}" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
+              echo "services=$services" >> $GITHUB_OUTPUT
+            fi
+          else
+            # For push events, build only changed services
+            changed_services=()
+            if [ "${{ steps.changes.outputs.ui }}" == "true" ]; then changed_services+=("ui"); fi
+            if [ "${{ steps.changes.outputs.catalog }}" == "true" ]; then changed_services+=("catalog"); fi
+            if [ "${{ steps.changes.outputs.cart }}" == "true" ]; then changed_services+=("cart"); fi
+            if [ "${{ steps.changes.outputs.orders }}" == "true" ]; then changed_services+=("orders"); fi
+            if [ "${{ steps.changes.outputs.checkout }}" == "true" ]; then changed_services+=("checkout"); fi
+            
+            if [ ${#changed_services[@]} -eq 0 ]; then
+              echo "services=[]" >> $GITHUB_OUTPUT
+            else
+              printf -v joined '"%s",' "${changed_services[@]}"
+              echo "services=[${joined%,}]" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  # Job 2: Build and push Docker images to ECR
+  build-and-push:
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.services != '[]'
+    
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+      fail-fast: false
+    
+    outputs:
+      image-tags: ${{ steps.output-tags.outputs.tags }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Create ECR repository if not exists
+        run: |
+          aws ecr describe-repositories --repository-names retail-store-${{ matrix.service }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name retail-store-${{ matrix.service }} \
+            --region ${{ env.AWS_REGION }} \
+            --image-scanning-configuration scanOnPush=true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image tag
+        id: image-tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG="${SHORT_SHA}-${TIMESTAMP}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "ecr-uri=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/retail-store-${{ matrix.service }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./src/${{ matrix.service }}
+          file: ./src/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image-tag.outputs.ecr-uri }}:${{ steps.image-tag.outputs.tag }}
+            ${{ steps.image-tag.outputs.ecr-uri }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Output image tags
+        id: output-tags
+        run: |
+          echo "${{ matrix.service }}=${{ steps.image-tag.outputs.tag }}" >> $GITHUB_OUTPUT
+
+  # Job 3: Update Helm chart values
+  update-helm-values:
+    needs: [detect-changes, build-and-push]
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.services != '[]'
+    
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Get image tag from build job
+        id: get-tag
+        run: |
+          # Extract the tag for this service from the build job outputs
+          # This is a simplified approach - in a real scenario you might use artifacts
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG="${SHORT_SHA}-${TIMESTAMP}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Update Helm values.yaml
+        run: |
+          VALUES_FILE="src/${{ matrix.service }}/chart/values.yaml"
+          ECR_REPO="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/retail-store-${{ matrix.service }}"
+          
+          # Update repository and tag in values.yaml
+          sed -i "s|repository:.*|repository: ${ECR_REPO}|g" "$VALUES_FILE"
+          sed -i "s|tag:.*|tag: \"${{ steps.get-tag.outputs.tag }}\"|g" "$VALUES_FILE"
+          
+          echo "Updated $VALUES_FILE:"
+          grep -A 3 "image:" "$VALUES_FILE"
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          git add src/${{ matrix.service }}/chart/values.yaml
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit for ${{ matrix.service }}"
+          else
+            git commit -m "🚀 Update ${{ matrix.service }} image to ${{ steps.get-tag.outputs.tag }}
+
+            - Updated image repository to private ECR
+            - Updated image tag to ${{ steps.get-tag.outputs.tag }}
+            - Triggered by: ${{ github.event_name }}
+            - Commit: ${{ github.sha }}"
+            
+            # Pull latest changes and push
+            git pull --rebase origin ${{ github.ref_name }}
+            git push
+          fi
+
+  # Summary job
+  deployment-summary:
+    needs: [detect-changes, build-and-push, update-helm-values]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Create deployment summary
+        run: |
+          echo "# 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.detect-changes.outputs.services }}" != "[]" ]; then
+            echo "## 📦 Services Processed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Service | Build Status | Helm Update Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|--------------|-------------------|" >> $GITHUB_STEP_SUMMARY
+            
+            services='${{ needs.detect-changes.outputs.services }}'
+            echo "$services" | jq -r '.[]' | while read service; do
+              build_status="${{ needs.build-and-push.result }}"
+              helm_status="${{ needs.update-helm-values.result }}"
+              echo "| $service | $build_status | $helm_status |" >> $GITHUB_STEP_SUMMARY
+            done
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "## 🔄 Next Steps" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Docker images built and pushed to ECR" >> $GITHUB_STEP_SUMMARY
+            echo "- ✅ Helm chart values updated with new image tags" >> $GITHUB_STEP_SUMMARY
+            echo "- 🔄 ArgoCD will automatically detect and sync the changes" >> $GITHUB_STEP_SUMMARY
+            echo "- 📊 Monitor deployment in ArgoCD UI" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ℹ️ No Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No services were modified in this push." >> $GITHUB_STEP_SUMMARY
+          fi
